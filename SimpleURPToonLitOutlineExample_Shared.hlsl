@@ -50,6 +50,9 @@ struct Attributes
     half3 normalOS      : NORMAL;
     half4 tangentOS     : TANGENT;
     float2 uv           : TEXCOORD0;
+
+    // to support GPU instancing and Single Pass Stereo rendering(VR), add the following section
+    UNITY_VERTEX_INPUT_INSTANCE_ID      // For non PSSL, equals to -> uint instanceID : SV_InstanceID;
 };
 
 // all pass will share this Varyings struct (define data needed from our vertex shader to our fragment shader)
@@ -59,6 +62,10 @@ struct Varyings
     float4 positionWSAndFogFactor   : TEXCOORD1; // xyz: positionWS, w: vertex fog factor
     half3 normalWS                  : TEXCOORD2;
     float4 positionCS               : SV_POSITION;
+
+    // to support GPU instancing and Single Pass Stereo rendering(VR), add the following section
+    UNITY_VERTEX_INPUT_INSTANCE_ID  // For non PSSL, equals to -> uint instanceID : SV_InstanceID;
+    UNITY_VERTEX_OUTPUT_STEREO      // For non OpenGL and non PSSL, equals to -> uint stereoTargetEyeIndexAsRTArrayIdx : SV_RenderTargetArrayIndex; (when UNITY_STEREO_INSTANCING_ENABLED)
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -145,6 +152,11 @@ float3 TransformPositionWSToOutlinePositionWS(float3 positionWS, float positionV
 {
     //you can replace it to your own method! Here we will write a simple world space method for tutorial reason, it is not the best method!
     float outlineExpandAmount = _OutlineWidth * GetOutlineCameraFovAndDistanceFixMultiplier(positionVS_Z);
+
+    #if defined(UNITY_STEREO_INSTANCING_ENABLED) || defined(UNITY_STEREO_MULTIVIEW_ENABLED) || defined(UNITY_STEREO_DOUBLE_WIDE_ENABLED)
+    outlineExpandAmount *= 0.5;
+    #endif
+    
     return positionWS + normalWS * outlineExpandAmount; 
 }
 
@@ -154,6 +166,14 @@ Varyings VertexShaderWork(Attributes input)
 {
     Varyings output;
 
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // after invalid/discard vertex, do this part asap.
+    // to support GPU instancing and Single Pass Stereo rendering(VR), add the following section
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    UNITY_SETUP_INSTANCE_ID(input);                 // will turn into this in non OpenGL and non PSSL -> UnitySetupInstanceID(input.instanceID);
+    UNITY_TRANSFER_INSTANCE_ID(input, output);      // will turn into this in non OpenGL and non PSSL -> output.instanceID = input.instanceID;
+    UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);  // will turn into this in non OpenGL and non PSSL -> output.stereoTargetEyeIndexAsRTArrayIdx = unity_StereoEyeIndex;
+    
     // VertexPositionInputs contains position in multiple spaces (world, view, homogeneous clip space, ndc)
     // Unity compiler will strip all unused references (say you don't use view space).
     // Therefore there is more flexibility at no additional cost with this struct.
@@ -380,6 +400,12 @@ half3 ApplyFog(half3 color, Varyings input)
 // #pragma fragment ShadeFinalColor
 half4 ShadeFinalColor(Varyings input) : SV_TARGET
 {
+    // to support GPU instancing and Single Pass Stereo rendering(VR), add the following section
+    //------------------------------------------------------------------------------------------------------------------------------
+    UNITY_SETUP_INSTANCE_ID(input);                     // in non OpenGL and non PSSL, MACRO will turn into -> UnitySetupInstanceID(input.instanceID);
+    UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);    // in non OpenGL and non PSSL, MACRO will turn into -> unity_StereoEyeIndex = input.stereoTargetEyeIndexAsRTArrayIdx;
+    //------------------------------------------------------------------------------------------------------------------------------
+    
     //////////////////////////////////////////////////////////////////////////////////////////
     // first prepare all data for lighting function
     //////////////////////////////////////////////////////////////////////////////////////////
@@ -403,9 +429,80 @@ half4 ShadeFinalColor(Varyings input) : SV_TARGET
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
-// fragment shared functions (for ShadowCaster pass & DepthOnly pass to use only)
+// fragment shared functions (for ShadowCaster, DepthOnly, DepthNormalsOnly pass to use only)
 //////////////////////////////////////////////////////////////////////////////////////////
-void BaseColorAlphaClipTest(Varyings input)
+
+// copy and edit of ShadowCasterPass.hlsl
+void AlphaClipAndLODTest(Varyings input)
 {
     DoClipTestToTargetAlphaValue(GetFinalBaseColor(input).a);
+
+    #ifdef LOD_FADE_CROSSFADE
+    LODFadeCrossFade(input.positionCS);
+    #endif
+}
+
+// copy and edit of DepthOnlyPass.hlsl
+half DepthOnlyFragment(Varyings input) : SV_TARGET
+{
+    UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+
+    AlphaClipAndLODTest(input);
+
+    return input.positionCS.z;
+}
+
+// copy and edit of LitDepthNormalsPass.hlsl
+void DepthNormalsFragment(
+    Varyings input
+    , out half4 outNormalWS : SV_Target0
+#ifdef _WRITE_RENDERING_LAYERS
+    , out float4 outRenderingLayers : SV_Target1
+#endif
+)
+{
+    UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+
+    AlphaClipAndLODTest(input);
+
+    #if defined(_GBUFFER_NORMALS_OCT)
+        float3 normalWS = normalize(input.normalWS);
+        float2 octNormalWS = PackNormalOctQuadEncode(normalWS);           // values between [-1, +1], must use fp32 on some platforms
+        float2 remappedOctNormalWS = saturate(octNormalWS * 0.5 + 0.5);   // values between [ 0,  1]
+        half3 packedNormalWS = PackFloat2To888(remappedOctNormalWS);      // values between [ 0,  1]
+        outNormalWS = half4(packedNormalWS, 0.0);
+    #else
+        float2 uv = input.uv;
+        #if defined(_PARALLAXMAP)
+            #if defined(REQUIRES_TANGENT_SPACE_VIEW_DIR_INTERPOLATOR)
+                half3 viewDirTS = input.viewDirTS;
+            #else
+                half3 viewDirTS = GetViewDirectionTangentSpace(input.tangentWS, input.normalWS, input.viewDirWS);
+            #endif
+            ApplyPerPixelDisplacement(viewDirTS, uv);
+        #endif
+
+        #if defined(_NORMALMAP) || defined(_DETAIL)
+            float sgn = input.tangentWS.w;      // should be either +1 or -1
+            float3 bitangent = sgn * cross(input.normalWS.xyz, input.tangentWS.xyz);
+            float3 normalTS = SampleNormal(uv, TEXTURE2D_ARGS(_BumpMap, sampler_BumpMap), _BumpScale);
+
+            #if defined(_DETAIL)
+                half detailMask = SAMPLE_TEXTURE2D(_DetailMask, sampler_DetailMask, uv).a;
+                float2 detailUv = uv * _DetailAlbedoMap_ST.xy + _DetailAlbedoMap_ST.zw;
+                normalTS = ApplyDetailNormal(detailUv, normalTS, detailMask);
+            #endif
+
+            float3 normalWS = TransformTangentToWorld(normalTS, half3x3(input.tangentWS.xyz, bitangent.xyz, input.normalWS.xyz));
+        #else
+            float3 normalWS = input.normalWS;
+        #endif
+
+        outNormalWS = half4(NormalizeNormalPerPixel(normalWS), 0.0);
+    #endif
+
+    #ifdef _WRITE_RENDERING_LAYERS
+        uint renderingLayers = GetMeshRenderingLayer();
+        outRenderingLayers = float4(EncodeMeshRenderingLayer(renderingLayers), 0, 0, 0);
+    #endif
 }
